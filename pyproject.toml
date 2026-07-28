@@ -1,0 +1,15 @@
+[project]
+name = "docs-to-speech"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.140.7",
+    "pydantic>=2.13.4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.0",
+]

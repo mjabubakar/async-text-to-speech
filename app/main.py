@@ -3,7 +3,7 @@ import uuid
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -43,6 +43,7 @@ app = FastAPI(
 
 app.add_middleware(ExceptionMiddleware)
 app.mount("/audio", StaticFiles(directory=settings.audio_output_dir), name="audio")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.exception_handler(RequestValidationError)
@@ -51,6 +52,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"detail": exc.errors()},
     )
+
+
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
 
 
 @app.post("/synthesize")

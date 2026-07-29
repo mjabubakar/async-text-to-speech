@@ -1,0 +1,56 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v7
+
+            - name: Install uv
+              uses: astral-sh/setup-uv@v5
+              with:
+                  version: "latest"
+
+            - name: Set up Python
+              run: uv python install 3.13
+
+            - name: Install dependencies
+              run: uv sync --all-extras --dev
+
+            - name: Lint with ruff
+              run: uv run ruff check .
+
+            - name: Check formatting with ruff
+              run: uv run ruff format --check .
+
+            - name: Download nltk data
+              run: uv run python -c "import nltk; nltk.download('punkt_tab')"
+
+            - name: Run tests with coverage
+              env:
+                  RABBITMQ_URL: "amqp://guest:guest@localhost:5672//"
+                  REDIS_URL: "redis://localhost:6379/0"
+                  ELEVENLABS_API_KEY: "test-key-not-used-mocked"
+              run: uv run pytest --cov=app --cov-report=term-missing --cov-fail-under=75
+
+    docker-build:
+        runs-on: ubuntu-latest
+        needs: test
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v7
+
+            - name: Build API image
+              run: docker build -t doc-to-speech-api -f Dockerfile .
+
+            - name: Build worker image
+              run: docker build -t doc-to-speech-worker -f Dockerfile.worker .

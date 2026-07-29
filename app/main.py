@@ -1,5 +1,7 @@
 import logging
 
+from celery import Celery
+from config import settings
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -28,12 +30,17 @@ class ExceptionMiddleware(BaseHTTPMiddleware):
         return response
 
 
+celery_app = Celery(
+    "worker",
+    broker=settings.rabbitmq_url,
+    backend=settings.redis_url,  # separate service for results/status
+)
+
 app = FastAPI(
     title="Async Document to Speech Pipeline",
     description="Queues text, chunks it, synthesizes via ElevenLabs, returns streamable audio",
     version="0.1.0",
 )
-
 
 app.add_middleware(ExceptionMiddleware)
 

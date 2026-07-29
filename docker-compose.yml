@@ -1,0 +1,14 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports:
+      - "5672:5672"
+      - "15672:15672" # management UI
+    # This automatically writes the config flag directly inside the container filesystem before startup
+    command: >
+      bash -c "echo 'deprecated_features.permit.transient_nonexcl_queues = true' > /etc/rabbitmq/rabbitmq.conf && exec rabbitmq-server"
+
+  redis:
+    image: redis:8
+    ports:
+      - "6379:6379"

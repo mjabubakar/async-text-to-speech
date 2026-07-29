@@ -18,3 +18,6 @@ celery_app.conf.update(
 @celery_app.task
 def add(x: int, y: int) -> int:
     return x + y
+
+
+import app.tasks  # noqa: F401  — registers synthesize_task with celery_app

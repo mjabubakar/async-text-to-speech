@@ -21,5 +21,8 @@ htmlcov/
 # Env
 .env
 
-# Audio files
-audio_output
+# Audio output (generated files, not source)
+audio_output/
+
+# OS
+.DS_Store

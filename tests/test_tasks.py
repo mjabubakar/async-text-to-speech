@@ -22,23 +22,63 @@ async def test_synthesize_chunk_returns_audio_bytes():
 
 
 @pytest.mark.asyncio
-async def test_synthesize_chunk_raises_on_http_error():
-    mock_response = MagicMock()
-    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
-        "error", request=MagicMock(), response=MagicMock(status_code=500)
+async def test_synthesize_chunk_retries_on_500_then_succeeds():
+    fail_response = MagicMock()
+    fail_response.status_code = 503
+    fail_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "server error", request=MagicMock(), response=fail_response
+    )
+
+    success_response = MagicMock()
+    success_response.content = b"audio-bytes"
+    success_response.raise_for_status = MagicMock()
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=[fail_response, success_response])
+
+    result = await _synthesize_chunk(mock_client, "test chunk")
+
+    assert result == b"audio-bytes"
+    assert mock_client.post.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_synthesize_chunk_does_not_retry_on_401():
+    fail_response = MagicMock()
+    fail_response.status_code = 401
+    fail_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "unauthorized", request=MagicMock(), response=fail_response
     )
 
     mock_client = AsyncMock()
-    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_client.post = AsyncMock(return_value=fail_response)
 
     with pytest.raises(httpx.HTTPStatusError):
-        await _synthesize_chunk(mock_client, "Hello world.")
+        await _synthesize_chunk(mock_client, "test chunk")
+
+    assert mock_client.post.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_synthesize_chunk_gives_up_after_max_attempts():
+    fail_response = MagicMock()
+    fail_response.status_code = 503
+    fail_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "server error", request=MagicMock(), response=fail_response
+    )
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=fail_response)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await _synthesize_chunk(mock_client, "test chunk")
+
+    assert mock_client.post.call_count == 4
 
 
 @pytest.mark.asyncio
 async def test_synthesize_all_chunks_preserves_order():
     async def fake_synthesize_chunk(client, chunk):
-        # simulate each chunk "returning" identifiable bytes
         return chunk.encode()
 
     with patch("app.tasks._synthesize_chunk", side_effect=fake_synthesize_chunk):
@@ -51,10 +91,15 @@ async def test_synthesize_all_chunks_preserves_order():
 def test_synthesize_task_writes_file_and_updates_redis(tmp_path):
     from app import tasks
 
+    async def fake_synthesize_all_chunks(chunks):
+        return [b"audio-bytes"]
+
     with (
         patch.object(tasks.settings, "audio_output_dir", tmp_path),
         patch("app.tasks.chunk_text", return_value=["Hello there."]),
-        patch("app.tasks.asyncio.run", return_value=[b"audio-bytes"]),
+        patch(
+            "app.tasks._synthesize_all_chunks", side_effect=fake_synthesize_all_chunks
+        ),
         patch("app.tasks.redis_client") as mock_redis,
     ):
         job_id = "test-job-123"
@@ -64,6 +109,5 @@ def test_synthesize_task_writes_file_and_updates_redis(tmp_path):
         output_file = tmp_path / f"{job_id}.mp3"
         assert output_file.read_bytes() == b"audio-bytes"
 
-        # confirm status was set to "done" at some point
         calls = [call.kwargs for call in mock_redis.hset.call_args_list]
         assert any(c.get("mapping", {}).get("status") == "done" for c in calls)

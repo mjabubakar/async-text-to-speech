@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "celery>=5.6.3",
     "fastapi[standard]>=0.140.7",
+    "nltk>=3.10.0",
     "pydantic>=2.13.4",
     "redis>=8.0.1",
 ]
@@ -14,8 +15,14 @@ dependencies = [
 [dependency-groups]
 dev = [
     "celery-types>=0.26.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
     "ruff>=0.16.0",
 ]
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

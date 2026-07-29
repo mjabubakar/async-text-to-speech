@@ -111,3 +111,55 @@ def test_synthesize_task_writes_file_and_updates_redis(tmp_path):
 
         calls = [call.kwargs for call in mock_redis.hset.call_args_list]
         assert any(c.get("mapping", {}).get("status") == "done" for c in calls)
+
+
+def test_synthesize_task_handles_empty_chunks(tmp_path):
+    from app import tasks
+
+    with (
+        patch.object(tasks.settings, "audio_output_dir", tmp_path),
+        patch("app.tasks.chunk_text", return_value=[]),
+        patch("app.tasks.redis_client") as mock_redis,
+    ):
+        result = tasks.synthesize_task.run("job-empty", "")
+
+        assert result == "job-empty"
+        calls = [call.kwargs for call in mock_redis.hset.call_args_list]
+        assert any(c.get("mapping", {}).get("status") == "failed" for c in calls)
+
+
+def test_synthesize_task_marks_failed_on_http_status_error(tmp_path):
+    from app import tasks
+
+    async def raise_http_error(chunks):
+        response = MagicMock(status_code=500)
+        raise httpx.HTTPStatusError(
+            "server error", request=MagicMock(), response=response
+        )
+
+    with (
+        patch.object(tasks.settings, "audio_output_dir", tmp_path),
+        patch("app.tasks.chunk_text", return_value=["Hello."]),
+        patch("app.tasks._synthesize_all_chunks", side_effect=raise_http_error),
+        patch("app.tasks.redis_client") as mock_redis,
+    ):
+        with pytest.raises(httpx.HTTPStatusError):
+            tasks.synthesize_task.run("job-fail-http", "Hello.")
+
+        calls = [call.kwargs for call in mock_redis.hset.call_args_list]
+        assert any(c.get("mapping", {}).get("status") == "failed" for c in calls)
+
+
+def test_synthesize_task_marks_failed_on_unexpected_exception(tmp_path):
+    from app import tasks
+
+    with (
+        patch.object(tasks.settings, "audio_output_dir", tmp_path),
+        patch("app.tasks.chunk_text", side_effect=RuntimeError("unexpected")),
+        patch("app.tasks.redis_client") as mock_redis,
+    ):
+        with pytest.raises(RuntimeError):
+            tasks.synthesize_task.run("job-fail-unexpected", "Hello.")
+
+        calls = [call.kwargs for call in mock_redis.hset.call_args_list]
+        assert any(c.get("mapping", {}).get("status") == "failed" for c in calls)

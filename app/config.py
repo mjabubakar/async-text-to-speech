@@ -2,7 +2,7 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-BASE_DIR = Path(__file__).resolve().parent.parent  # repo root
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
@@ -15,5 +15,13 @@ class Settings(BaseSettings):
     rabbitmq_url: str
     redis_url: str
 
+    elevenlabs_api_key: str
+    elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"  # ElevenLabs default demo voice
+
+    audio_output_dir: Path = BASE_DIR / "audio_output"
+    max_chunk_chars: int = 4000
+
 
 settings = Settings()  # type: ignore[call-arg]
+
+settings.audio_output_dir.mkdir(parents=True, exist_ok=True)

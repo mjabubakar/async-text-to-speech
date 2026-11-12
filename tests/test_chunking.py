@@ -3,75 +3,68 @@ import pytest
 from app.chunking import chunk_text
 
 
-def test_empty_text_returns_empty_list():
+def normalize(s: str) -> str:
+    return " ".join(s.split())
+
+
+def test_empty_and_whitespace_return_empty_list():
     assert chunk_text("") == []
-
-
-def test_whitespace_only_returns_empty_list():
     assert chunk_text("   \n\n   ") == []
 
 
-def test_short_text_returns_single_chunk():
+@pytest.mark.parametrize("bad", [0, -10])
+def test_non_positive_max_chars_raises(bad):
+    with pytest.raises(ValueError):
+        chunk_text("Some text.", max_chars=bad)
+
+
+def test_short_text_is_a_single_unchanged_chunk():
     text = "This is a short sentence. Here is another one."
-    result = chunk_text(text, max_chars=4500)
-    assert result == [text]
+    assert chunk_text(text, max_chars=4500) == [text]
 
 
-def test_splits_on_sentence_boundaries_not_mid_sentence():
+def test_splits_exactly_on_sentence_boundaries():
     text = "First sentence here. Second sentence here. Third sentence here."
-    # force a split after roughly one sentence
-    result = chunk_text(text, max_chars=25)
-    assert len(result) > 1
-    for chunk in result:
-        # every chunk should end with sentence-ending punctuation
-        assert chunk.rstrip()[-1] in ".!?"
+    assert chunk_text(text, max_chars=25) == [
+        "First sentence here.",
+        "Second sentence here.",
+        "Third sentence here.",
+    ]
 
 
-def test_no_chunk_exceeds_max_chars_when_sentences_fit():
+def test_every_chunk_within_limit_and_content_preserved():
     text = "Short one. Short two. Short three. Short four. Short five."
-    max_chars = 20
-    result = chunk_text(text, max_chars=max_chars)
-    for chunk in result:
-        assert len(chunk) <= max_chars
+    chunks = chunk_text(text, max_chars=20)
+    assert all(len(c) <= 20 for c in chunks)
+    assert normalize(" ".join(chunks)) == normalize(text)
 
 
-def test_oversized_single_sentence_is_its_own_chunk():
-    long_sentence = "This is a single very long sentence " + ("word " * 50) + "end."
-    result = chunk_text(long_sentence, max_chars=50)
-    assert len(result) == 1
-    assert result[0] == long_sentence.strip()
+def test_paragraph_break_is_preserved_inside_a_chunk():
+    assert chunk_text("Paragraph one.\n\nParagraph two.", max_chars=4500) == [
+        "Paragraph one.\n\nParagraph two."
+    ]
 
 
-def test_paragraphs_are_respected():
-    text = "Paragraph one sentence.\n\nParagraph two sentence."
-    result = chunk_text(text, max_chars=4500)
-    # both paragraphs fit comfortably in one chunk together
-    assert len(result) == 1
-    assert "Paragraph one" in result[0]
-    assert "Paragraph two" in result[0]
+def test_crlf_paragraph_breaks_are_normalized():
+    assert chunk_text("Para one.\r\n\r\nPara two.", max_chars=4500) == [
+        "Para one.\n\nPara two."
+    ]
 
 
-def test_reconstructed_chunks_preserve_all_sentences():
-    text = "Alpha sentence. Beta sentence. Gamma sentence. Delta sentence."
-    result = chunk_text(text, max_chars=30)
-    combined = " ".join(result)
-    for word in ["Alpha", "Beta", "Gamma", "Delta"]:
-        assert word in combined
+def test_oversized_sentence_is_split_and_every_chunk_fits():
+    sentence = "This is a single very long sentence " + ("word " * 50) + "end."
+    chunks = chunk_text(sentence, max_chars=50)
+    assert len(chunks) > 1
+    assert all(len(c) <= 50 for c in chunks)
+    assert normalize(" ".join(chunks)) == normalize(sentence)
 
 
-def test_zero_max_chars_raises_value_error():
-    with pytest.raises(ValueError):
-        chunk_text("Some text.", max_chars=0)
+def test_single_word_longer_than_limit_is_cut():
+    chunks = chunk_text("x" * 105, max_chars=50)
+    assert all(len(c) <= 50 for c in chunks)
+    assert "".join(chunks) == "x" * 105
 
 
-def test_negative_max_chars_raises_value_error():
-    with pytest.raises(ValueError):
-        chunk_text("Some text.", max_chars=-10)
-
-
-def test_abbreviations_do_not_cause_false_sentence_splits():
+def test_abbreviation_does_not_cause_false_split():
     text = "Dr. Smith went to the store. He bought milk."
-    result = chunk_text(text, max_chars=4500)
-    # nltk should treat "Dr. Smith" as one sentence unit, not split after "Dr."
-    assert len(result) == 1
-    assert "Dr. Smith went to the store." in result[0]
+    assert chunk_text(text, max_chars=4500) == [text]

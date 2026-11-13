@@ -1,63 +1,125 @@
-def test_synthesize_returns_job_id(client, mock_redis, mock_task_delay):
-    response = client.post("/synthesize", json={"text": "Hello world."})
+import uuid
 
-    assert response.status_code == 200
-    body = response.json()
-    assert "job_id" in body
-    assert isinstance(body["job_id"], str)
+import pytest
 
+from app.config import settings
 
-def test_synthesize_enqueues_task(client, mock_redis, mock_task_delay):
-    response = client.post("/synthesize", json={"text": "Hello world."})
-    job_id = response.json()["job_id"]
-
-    mock_task_delay.assert_called_once()
-    args = mock_task_delay.call_args[0]
-    assert args[0] == job_id
-    assert args[1] == "Hello world."
+PAYLOAD = {"text": "Hello world."}
 
 
-def test_synthesize_sets_initial_status_queued(client, mock_redis, mock_task_delay):
-    response = client.post("/synthesize", json={"text": "Hello world."})
-    job_id = response.json()["job_id"]
-
-    job = mock_redis.hgetall(f"job:{job_id}")
-    assert job.get("status") == "queued"
+def test_synthesize_returns_uuid_job_id(client, fake_redis, mock_task_delay):
+    r = client.post("/synthesize", json=PAYLOAD)
+    assert r.status_code == 200
+    uuid.UUID(r.json()["job_id"])
 
 
-def test_synthesize_missing_text_returns_422(client, mock_redis, mock_task_delay):
-    response = client.post("/synthesize", json={})
-
-    assert response.status_code == 422
-    assert "detail" in response.json()
-
-
-def test_synthesize_wrong_type_returns_422(client, mock_redis, mock_task_delay):
-    response = client.post("/synthesize", json={"text": 12345})
-
-    assert response.status_code == 422
+def test_synthesize_enqueues_task_and_sets_queued_with_ttl(
+    client, fake_redis, mock_task_delay
+):
+    job_id = client.post("/synthesize", json=PAYLOAD).json()["job_id"]
+    mock_task_delay.assert_called_once_with(job_id, "Hello world.")
+    assert fake_redis.hget(f"job:{job_id}", "status") == "queued"
+    assert fake_redis.ttl(f"job:{job_id}") == settings.job_ttl_seconds
 
 
-def test_get_job_returns_status_when_exists(client, mock_redis):
-    mock_redis.hset(
-        "job:abc123", mapping={"status": "done", "audio_url": "/audio/abc123.mp3"}
+@pytest.mark.parametrize("body", [{}, {"text": 12345}, {"text": ""}, {"text": "  \n "}])
+def test_invalid_text_returns_422_json_and_enqueues_nothing(
+    client, fake_redis, mock_task_delay, body
+):
+    r = client.post("/synthesize", json=body)
+    assert r.status_code == 422
+    assert "detail" in r.json()  # also proves the error body is JSON-serializable
+    mock_task_delay.assert_not_called()
+
+
+def test_oversized_text_returns_422(client, fake_redis, mock_task_delay):
+    r = client.post("/synthesize", json={"text": "a" * (settings.max_text_chars + 1)})
+    assert r.status_code == 422
+    mock_task_delay.assert_not_called()
+
+
+def test_broker_down_returns_503_and_marks_job_failed(
+    client, fake_redis, mock_task_delay
+):
+    mock_task_delay.side_effect = ConnectionError("broker down")
+    r = client.post("/synthesize", json=PAYLOAD)
+    assert r.status_code == 503
+    (key,) = fake_redis.keys("job:")
+    assert fake_redis.hget(key, "status") == "failed"
+
+
+def test_unexpected_error_returns_generic_500(
+    client, fake_redis, mock_task_delay, monkeypatch
+):
+    async def boom(*a, **k):
+        raise RuntimeError("secret-internal-detail")
+
+    monkeypatch.setattr("app.main.jobs.set_status_async", boom)
+    r = client.post("/synthesize", json=PAYLOAD)
+    assert r.status_code == 500
+    assert "secret-internal-detail" not in r.text
+
+
+# ---------- auth and rate limiting ----------
+
+
+def test_auth_is_disabled_by_default(client, fake_redis, mock_task_delay):
+    assert client.post("/synthesize", json=PAYLOAD).status_code == 200
+
+
+def test_api_key_is_enforced_when_configured(
+    client, fake_redis, mock_task_delay, monkeypatch
+):
+    monkeypatch.setattr(settings, "api_key", "s3cret")
+    assert client.post("/synthesize", json=PAYLOAD).status_code == 401
+    assert (
+        client.post(
+            "/synthesize", json=PAYLOAD, headers={"X-API-Key": "wrong"}
+        ).status_code
+        == 401
     )
+    assert (
+        client.post(
+            "/synthesize", json=PAYLOAD, headers={"X-API-Key": "s3cret"}
+        ).status_code
+        == 200
+    )
+    assert mock_task_delay.call_count == 1  # rejected requests never enqueue
 
-    response = client.get("/jobs/abc123")
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "done"
-    assert body["audio_url"] == "/audio/abc123.mp3"
+def test_rate_limit_returns_429_with_retry_after(
+    client, fake_redis, mock_task_delay, monkeypatch
+):
+    monkeypatch.setattr(settings, "rate_limit_per_minute", 2)
+    assert client.post("/synthesize", json=PAYLOAD).status_code == 200
+    assert client.post("/synthesize", json=PAYLOAD).status_code == 200
+    r = client.post("/synthesize", json=PAYLOAD)
+    assert r.status_code == 429
+    assert 1 <= int(r.headers["retry-after"]) <= 60
+    assert mock_task_delay.call_count == 2
 
 
-def test_get_job_returns_404_when_not_found(client, mock_redis):
-    response = client.get("/jobs/does-not-exist")
+# ---------- /jobs and misc ----------
 
-    assert response.status_code == 404
+
+def test_get_job_returns_state(client, fake_redis):
+    jid = str(uuid.uuid4())
+    fake_redis.hset(
+        f"job:{jid}", mapping={"status": "done", "audio_url": f"/audio/{jid}.mp3"}
+    )
+    r = client.get(f"/jobs/{jid}")
+    assert r.status_code == 200
+    assert r.json() == {"status": "done", "audio_url": f"/audio/{jid}.mp3"}
+
+
+def test_get_job_404_when_unknown(client, fake_redis):
+    assert client.get(f"/jobs/{uuid.uuid4()}").status_code == 404
+
+
+def test_get_job_rejects_non_uuid(client, fake_redis):
+    assert client.get("/jobs/not-a-uuid").status_code == 422
 
 
 def test_root_serves_frontend(client):
-    response = client.get("/")
-    assert response.status_code == 200
-    assert "text/html" in response.headers["content-type"]
+    r = client.get("/")
+    assert r.status_code == 200 and "text/html" in r.headers["content-type"]

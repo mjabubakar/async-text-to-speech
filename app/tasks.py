@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 
 import httpx
 from tenacity import (
@@ -12,18 +13,17 @@ from tenacity import (
     wait_exponential,
 )
 
+from app import jobs
+from app import redis_client as rc
 from app.celery_app import celery_app
 from app.chunking import chunk_text
+from app.cleanup import cleanup_old_audio
 from app.config import settings
-from app.redis_client import redis_client
 
 logger = logging.getLogger(__name__)
 
 ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 
-# Retry on transient failures (server errors, timeouts, connection issues) —
-# NOT on 4xx client errors like bad auth or malformed input, which won't
-# succeed no matter how many times we retry.
 RETRYABLE_EXCEPTIONS = (
     httpx.TimeoutException,
     httpx.ConnectError,
@@ -31,19 +31,17 @@ RETRYABLE_EXCEPTIONS = (
 )
 
 
-def _is_retryable_http_status_error(exc: BaseException) -> bool:
-    """Retry on 5xx (server-side, likely transient) and 429 (rate limit)."""
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code >= 500 or exc.response.status_code == 429
-    return isinstance(exc, RETRYABLE_EXCEPTIONS)
-
-
 def _should_retry(exc: BaseException) -> bool:
-    """True if this exception represents a transient failure worth retrying."""
+    """Retry transient failures (timeouts, connection errors, 5xx, 429).
+
+    4xx errors such as a bad API key or malformed input are never retried:
+    they will not succeed no matter how many times we try.
+    """
     if isinstance(exc, RETRYABLE_EXCEPTIONS):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code >= 500 or exc.response.status_code == 429
+        code = exc.response.status_code
+        return code >= 500 or code == 429
     return False
 
 
@@ -54,42 +52,74 @@ def _should_retry(exc: BaseException) -> bool:
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
-async def _synthesize_chunk(client: httpx.AsyncClient, chunk: str) -> bytes:
-    """Call ElevenLabs TTS API for a single chunk, return raw audio bytes.
+async def _synthesize_chunk(
+    client: httpx.AsyncClient,
+    chunk: str,
+    previous_text: str | None = None,
+    next_text: str | None = None,
+) -> bytes:
+    """Call ElevenLabs TTS for one chunk and return raw audio bytes.
 
-    Retries up to 4 attempts total, with exponential backoff (2s, 4s, 8s,
-    capped at 20s) between attempts. Only retries on transient failures
-    (timeouts, connection errors, 5xx, 429) — a 401/400 fails immediately
-    since retrying won't fix a bad API key or malformed request.
+    Up to 4 attempts in total, with exponential backoff (2s minimum, 20s cap).
+    previous_text/next_text give the model neighbouring context so the prosody
+    stays continuous across chunk boundaries.
     """
-    try:
-        response = await client.post(
-            ELEVENLABS_TTS_URL.format(voice_id=settings.elevenlabs_voice_id),
-            headers={
-                "xi-api-key": settings.elevenlabs_api_key,
-                "Content-Type": "application/json",
-            },
-            json={"text": chunk, "model_id": "eleven_multilingual_v2"},
-            timeout=60.0,
-        )
-        response.raise_for_status()
-        return response.content
-    except httpx.HTTPStatusError as e:
-        if not _is_retryable_http_status_error(e):
-            logger.error("Non-retryable ElevenLabs error: %s", e.response.status_code)
-            raise
-        raise
+    payload: dict[str, str] = {"text": chunk, "model_id": settings.elevenlabs_model_id}
+    if previous_text:
+        payload["previous_text"] = previous_text
+    if next_text:
+        payload["next_text"] = next_text
+
+    response = await client.post(
+        ELEVENLABS_TTS_URL.format(voice_id=settings.elevenlabs_voice_id),
+        headers={
+            "xi-api-key": settings.elevenlabs_api_key,
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    return response.content
+
+
+def _context_for(chunks: list[str], index: int) -> dict[str, str | None]:
+    n = settings.context_chars
+    return {
+        "previous_text": chunks[index - 1][-n:] if index > 0 else None,
+        "next_text": chunks[index + 1][:n] if index < len(chunks) - 1 else None,
+    }
 
 
 async def _synthesize_all_chunks(chunks: list[str]) -> list[bytes]:
-    """Call ElevenLabs for every chunk concurrently, preserving chunk order."""
+    """Synthesize all chunks concurrently, at most `tts_concurrency` in flight.
+
+    The semaphore wraps the retry loop, so a chunk waiting to retry keeps its slot
+    and the cap holds under failure too. Results come back in chunk order.
+    """
+    semaphore = asyncio.Semaphore(settings.tts_concurrency)
+
+    async def run_one(client: httpx.AsyncClient, index: int) -> bytes:
+        async with semaphore:
+            return await _synthesize_chunk(
+                client, chunks[index], **_context_for(chunks, index)
+            )
+
     async with httpx.AsyncClient() as client:
-        tasks = [_synthesize_chunk(client, chunk) for chunk in chunks]
-        return await asyncio.gather(*tasks)
+        return list(
+            await asyncio.gather(*(run_one(client, i) for i in range(len(chunks))))
+        )
 
 
 def _set_status(job_id: str, **fields: str) -> None:
-    redis_client.hset(f"job:{job_id}", mapping=fields)
+    jobs.set_status_sync(rc.sync_redis, job_id, **fields)
+
+
+def _cleanup_quietly() -> None:
+    try:
+        cleanup_old_audio(settings.audio_output_dir, settings.audio_retention_seconds)
+    except Exception:
+        logger.warning("Audio cleanup failed", exc_info=True)
 
 
 @celery_app.task(bind=True)
@@ -104,10 +134,12 @@ def synthesize_task(self, job_id: str, text: str) -> str:
             return job_id
 
         audio_parts = asyncio.run(_synthesize_all_chunks(chunks))
-        stitched_audio = b"".join(audio_parts)
 
+        # write to a temp file, then rename: the API never serves a partial file
         output_path = settings.audio_output_dir / f"{job_id}.mp3"
-        output_path.write_bytes(stitched_audio)
+        tmp_path = settings.audio_output_dir / f"{job_id}.mp3.tmp"
+        tmp_path.write_bytes(b"".join(audio_parts))
+        os.replace(tmp_path, output_path)
 
         _set_status(
             job_id,
@@ -117,17 +149,24 @@ def synthesize_task(self, job_id: str, text: str) -> str:
         )
         return job_id
 
+    # Clients see short, generic messages; full details go to the worker log only.
     except httpx.HTTPStatusError as e:
         logger.exception("ElevenLabs API error for job %s (exhausted retries)", job_id)
         _set_status(
             job_id, status="failed", error=f"TTS API error: {e.response.status_code}"
         )
         raise
-    except RETRYABLE_EXCEPTIONS as e:
+    except RETRYABLE_EXCEPTIONS:
         logger.exception("Network error for job %s (exhausted retries)", job_id)
-        _set_status(job_id, status="failed", error=f"Network error: {e}")
+        _set_status(
+            job_id, status="failed", error="Network error contacting TTS provider"
+        )
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("Unhandled error synthesizing job %s", job_id)
-        _set_status(job_id, status="failed", error=str(e))
+        _set_status(
+            job_id, status="failed", error="Internal error while synthesizing audio"
+        )
         raise
+    finally:
+        _cleanup_quietly()

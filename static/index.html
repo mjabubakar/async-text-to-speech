@@ -2,7 +2,8 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>Document to Speech</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Text to Speech</title>
     <style>
       body {
         font-family: sans-serif;
@@ -10,11 +11,21 @@
         margin: 40px auto;
         padding: 0 20px;
       }
+      label {
+        display: block;
+        margin-top: 12px;
+        font-weight: 600;
+      }
       textarea {
         width: 100%;
         height: 200px;
         font-size: 1rem;
         padding: 8px;
+        box-sizing: border-box;
+      }
+      input {
+        width: 100%;
+        padding: 6px;
         box-sizing: border-box;
       }
       button {
@@ -42,92 +53,107 @@
     </style>
   </head>
   <body>
-    <h1>Document to Speech</h1>
+    <h1>Text to Speech</h1>
+    <label for="textInput">Text</label>
     <textarea id="textInput" placeholder="Paste your text here..."></textarea>
-    <br />
+    <label for="apiKey">API key (only if the server requires one)</label>
+    <input id="apiKey" type="password" autocomplete="off" />
     <button id="submitBtn">Synthesize</button>
-    <div id="status"></div>
+    <div id="status" role="status" aria-live="polite"></div>
     <audio id="player" controls></audio>
 
     <script>
+      const POLL_INTERVAL_MS = 2000;
+      const POLL_TIMEOUT_MS = 10 * 60 * 1000;
+
       const submitBtn = document.getElementById("submitBtn");
       const textInput = document.getElementById("textInput");
+      const apiKeyInput = document.getElementById("apiKey");
       const statusEl = document.getElementById("status");
       const player = document.getElementById("player");
-
-      const POLL_INTERVAL_MS = 2000;
 
       function setStatus(message, isError = false) {
         statusEl.textContent = message;
         statusEl.className = isError ? "error" : "";
       }
 
-      async function pollJob(jobId) {
+      function finish(message, isError = false) {
+        setStatus(message, isError);
+        submitBtn.disabled = false;
+      }
+
+      function friendlyError(status) {
+        if (status === 401) return "API key missing or invalid.";
+        if (status === 422) return "Text is empty or too long.";
+        if (status === 429)
+          return "Too many requests. Wait a minute and retry.";
+        if (status === 503)
+          return "Service temporarily unavailable. Try again shortly.";
+        return `Request failed (${status}).`;
+      }
+
+      async function pollJob(jobId, deadline) {
+        if (Date.now() > deadline) {
+          return finish(
+            "Timed out waiting for the job. Please try again.",
+            true,
+          );
+        }
         try {
           const res = await fetch(`/jobs/${jobId}`);
-          if (!res.ok) {
-            setStatus(`Error checking job status (${res.status})`, true);
-            submitBtn.disabled = false;
-            return;
-          }
+          if (!res.ok) return finish(friendlyError(res.status), true);
           const data = await res.json();
 
           if (data.status === "done") {
-            setStatus("Done! Playing audio.");
             player.src = data.audio_url;
             player.style.display = "block";
-            player.play();
             submitBtn.disabled = false;
+            try {
+              await player.play();
+              setStatus("Done! Playing audio.");
+            } catch (err) {
+              if (err.name === "NotAllowedError") {
+                setStatus("Done. Press play to listen."); // autoplay blocked
+              } else {
+                setStatus("Done, but the audio could not be loaded.", true);
+              }
+            }
           } else if (data.status === "failed") {
-            setStatus(
-              `Synthesis failed: ${data.error || "unknown error"}`,
-              true,
-            );
-            submitBtn.disabled = false;
+            finish(`Synthesis failed: ${data.error || "unknown error"}`, true);
           } else {
             setStatus(`Status: ${data.status}...`);
-            setTimeout(() => pollJob(jobId), POLL_INTERVAL_MS);
+            setTimeout(() => pollJob(jobId, deadline), POLL_INTERVAL_MS);
           }
         } catch (err) {
-          setStatus(`Network error while polling: ${err.message}`, true);
-          submitBtn.disabled = false;
+          finish(`Network error while polling: ${err.message}`, true);
         }
       }
 
       submitBtn.addEventListener("click", async () => {
         const text = textInput.value.trim();
-        if (!text) {
-          setStatus("Please enter some text first.", true);
-          return;
-        }
+        if (!text) return setStatus("Please enter some text first.", true);
 
         submitBtn.disabled = true;
+        player.pause();
+        player.removeAttribute("src");
         player.style.display = "none";
         setStatus("Submitting...");
+
+        const headers = { "Content-Type": "application/json" };
+        if (apiKeyInput.value) headers["X-API-Key"] = apiKeyInput.value;
 
         try {
           const res = await fetch("/synthesize", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers,
             body: JSON.stringify({ text }),
           });
-
-          if (!res.ok) {
-            const err = await res.json().catch(() => ({}));
-            setStatus(
-              `Submission failed (${res.status}): ${JSON.stringify(err.detail || err)}`,
-              true,
-            );
-            submitBtn.disabled = false;
-            return;
-          }
-
+          if (!res.ok) return finish(friendlyError(res.status), true);
           const { job_id } = await res.json();
           setStatus("Queued. Waiting for processing...");
-          pollJob(job_id);
+          pollJob(job_id, Date.now() + POLL_TIMEOUT_MS);
         } catch (err) {
-          setStatus(`Network error: ${err.message}`, true);
-          submitBtn.disabled = false;
+          finish(`Network error: ${err.message}`, true);
         }
       });
     </script>
